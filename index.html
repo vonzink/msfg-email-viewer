@@ -12,12 +12,11 @@
     <!-- Sidebar -->
     <div class="w-1/3 border-r bg-gray-100 flex flex-col">
       <div class="p-4 flex items-center justify-between border-b bg-white sticky top-0">
-        <h2 class="text-lg font-bold text-green-700 flex items-center gap-2">📥 Inbox</h2>
+        <h2 class="text-lg font-bold text-green-700 flex items-center gap-2">&#x1F4E5; Inbox</h2>
         <button id="refresh" class="bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700">Refresh</button>
       </div>
       <ul id="emailList" class="flex-1 overflow-y-auto divide-y divide-gray-200"></ul>
     </div>
-
     <!-- Main content -->
     <div class="w-2/3 flex flex-col">
       <div class="p-5 border-b bg-white sticky top-0">
@@ -39,32 +38,180 @@
     const BUCKET = "msfginfo-emails";
     const PREFIX = "info_emails/";
 
+    // --- Header parsing ---
+    function unfoldHeaders(raw) {
+      // RFC 5322: header continuation lines start with whitespace
+      return raw.replace(/\r?\n([ \t]+)/g, ' ');
+    }
+
     function parseHeaders(raw) {
-      const header = raw.split(/\r?\n\r?\n/)[0];
-      const get = (name) => (header.match(new RegExp(`^${name}:\\s*(.*)`, "mi")) || [,""])[1].trim();
+      const headerBlock = unfoldHeaders(raw.split(/\r?\n\r?\n/)[0]);
+      const get = (name) => {
+        const m = headerBlock.match(new RegExp(`^${name}:\\s*(.*)`, "mi"));
+        return m ? m[1].trim() : "";
+      };
       return {
         from: get("From") || "Unknown",
         to: get("To") || "Unknown",
-        subject: get("Subject") || "(No subject)",
-        date: get("Date") || ""
+        subject: decodeRFC2047(get("Subject")) || "(No subject)",
+        date: get("Date") || "",
+        contentType: get("Content-Type") || "",
+        contentTransferEncoding: get("Content-Transfer-Encoding") || ""
       };
     }
 
-    function decodeQuotedPrintable(str) {
-      if (!str) return "";
-      return str
-        .replace(/=\r?\n/g, "") // Remove soft line breaks
-        .replace(/=([A-Fa-f0-9]{2})/g, (_, hex) =>
-          String.fromCharCode(parseInt(hex, 16))
-        );
+    // Decode RFC 2047 encoded words in headers (=?charset?encoding?text?=)
+    function decodeRFC2047(str) {
+      if (!str) return str;
+      return str.replace(/=\?([^?]+)\?(B|Q)\?([^?]+)\?=/gi, (_, charset, encoding, text) => {
+        if (encoding.toUpperCase() === 'B') {
+          return decodeBase64(text, charset);
+        } else {
+          // Q encoding is like quoted-printable but _ = space
+          const qp = text.replace(/_/g, ' ');
+          return decodeQuotedPrintable(qp);
+        }
+      });
     }
 
+    // --- Content-Transfer-Encoding decoders ---
+    function decodeQuotedPrintable(str) {
+      if (!str) return "";
+      const cleaned = str.replace(/=\r?\n/g, ""); // remove soft line breaks
+      // Collect bytes properly for UTF-8
+      const bytes = [];
+      let i = 0;
+      while (i < cleaned.length) {
+        if (cleaned[i] === '=' && i + 2 < cleaned.length && /[A-Fa-f0-9]{2}/.test(cleaned.substring(i + 1, i + 3))) {
+          bytes.push(parseInt(cleaned.substring(i + 1, i + 3), 16));
+          i += 3;
+        } else {
+          bytes.push(cleaned.charCodeAt(i));
+          i++;
+        }
+      }
+      return new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes));
+    }
+
+    function decodeBase64(str, charset) {
+      if (!str) return "";
+      try {
+        const cleaned = str.replace(/\s/g, '');
+        const binary = atob(cleaned);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new TextDecoder(charset || 'utf-8', { fatal: false }).decode(bytes);
+      } catch (e) {
+        console.warn("Base64 decode failed:", e);
+        return str;
+      }
+    }
+
+    function decodeBody(body, encoding) {
+      const enc = (encoding || "").toLowerCase().trim();
+      if (enc === "base64") return decodeBase64(body);
+      if (enc === "quoted-printable") return decodeQuotedPrintable(body);
+      return body; // 7bit, 8bit, binary — pass through
+    }
+
+    // --- MIME multipart parser ---
+    function getBoundary(contentType) {
+      const m = contentType.match(/boundary="?([^";\s]+)"?/i);
+      return m ? m[1] : null;
+    }
+
+    function parseMimeParts(body, boundary) {
+      const delimiter = "--" + boundary;
+      const parts = body.split(delimiter);
+      const result = [];
+
+      // Skip preamble (parts[0]) and epilogue (after --boundary--)
+      for (let i = 1; i < parts.length; i++) {
+        const part = parts[i];
+        if (part.startsWith("--")) break; // closing delimiter
+
+        const splitIdx = part.search(/\r?\n\r?\n/);
+        if (splitIdx === -1) continue;
+
+        const headerRaw = part.substring(0, splitIdx);
+        const bodyRaw = part.substring(splitIdx).replace(/^\r?\n\r?\n/, "");
+        // Trim trailing CRLF
+        const bodyClean = bodyRaw.replace(/\r?\n$/, "");
+
+        const headers = parseHeaders(headerRaw + "\r\n\r\n");
+        result.push({
+          contentType: headers.contentType,
+          encoding: headers.contentTransferEncoding,
+          body: bodyClean
+        });
+      }
+      return result;
+    }
+
+    function extractBestPart(raw, contentType) {
+      const boundary = getBoundary(contentType);
+      if (!boundary) {
+        // Not multipart — return the body as-is with content type info
+        return { body: raw, contentType: contentType };
+      }
+
+      const parts = parseMimeParts(raw, boundary);
+
+      // Recursively handle nested multipart (e.g. multipart/alternative inside multipart/mixed)
+      for (const part of parts) {
+        if (part.contentType.toLowerCase().includes("multipart/")) {
+          const nested = extractBestPart(part.body, part.contentType);
+          if (nested) return nested;
+        }
+      }
+
+      // Prefer text/html, then text/plain
+      const htmlPart = parts.find(p => p.contentType.toLowerCase().includes("text/html"));
+      if (htmlPart) {
+        return {
+          body: decodeBody(htmlPart.body, htmlPart.encoding),
+          contentType: htmlPart.contentType
+        };
+      }
+
+      const textPart = parts.find(p => p.contentType.toLowerCase().includes("text/plain"));
+      if (textPart) {
+        return {
+          body: decodeBody(textPart.body, textPart.encoding),
+          contentType: textPart.contentType
+        };
+      }
+
+      // Fallback: first part with any text content type
+      const anyText = parts.find(p => p.contentType.toLowerCase().includes("text/"));
+      if (anyText) {
+        return {
+          body: decodeBody(anyText.body, anyText.encoding),
+          contentType: anyText.contentType
+        };
+      }
+
+      return null;
+    }
+
+    // --- Sanitize HTML for safe display ---
+    function sanitizeHTML(html) {
+      // Remove script tags and event handlers
+      return html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
+        .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
+        .replace(/javascript\s*:/gi, 'blocked:');
+    }
+
+    // --- Fetch & list ---
     function fetchEmailHeaders(key) {
       return new Promise((resolve) => {
         s3.getObject({ Bucket: BUCKET, Key: key, Range: "bytes=0-8191" }, function (err, data) {
           if (err || !data || !data.Body) return resolve({ key, from: "Unknown", to: "Unknown", subject: "(No subject)", date: "" });
           const text = new TextDecoder().decode(data.Body);
-          resolve({ key, ...parseHeaders(text) });
+          const h = parseHeaders(text);
+          resolve({ key, from: h.from, to: h.to, subject: h.subject, date: h.date });
         });
       });
     }
@@ -81,7 +228,7 @@
         }
 
         const items = (data.Contents || [])
-          .filter(o => o.Key !== PREFIX)
+          .filter(o => o.Key !== PREFIX && o.Size > 0 && !o.Key.endsWith('/'))
           .sort((a,b) => new Date(b.LastModified) - new Date(a.LastModified));
 
         const meta = await Promise.all(items.map(i => fetchEmailHeaders(i.Key)));
@@ -91,9 +238,9 @@
           const li = document.createElement("li");
           li.innerHTML = `
             <button class="w-full text-left hover:bg-green-50 p-3">
-              <p class="font-semibold text-sm truncate text-gray-800">${m.subject}</p>
-              <p class="text-xs text-gray-600 truncate">From: ${m.from}</p>
-              <p class="text-xs text-gray-600 truncate">To: ${m.to}</p>
+              <p class="font-semibold text-sm truncate text-gray-800">${escapeHTML(m.subject)}</p>
+              <p class="text-xs text-gray-600 truncate">From: ${escapeHTML(m.from)}</p>
+              <p class="text-xs text-gray-600 truncate">To: ${escapeHTML(m.to)}</p>
               <p class="text-[11px] text-gray-400 mt-1">${new Date(items.find(i => i.Key === m.key).LastModified).toLocaleString()}</p>
             </button>`;
           li.onclick = () => viewEmail(s3, m.key);
@@ -104,7 +251,13 @@
       });
     }
 
-    // 📧 Quoted-printable–aware email viewer
+    function escapeHTML(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // --- View email with full MIME support ---
     function viewEmail(s3, key) {
       const emailContent = document.getElementById("emailContent");
       emailContent.innerHTML = "<p class='text-gray-400 text-sm'>Loading...</p>";
@@ -116,22 +269,59 @@
           return;
         }
 
-        let raw = new TextDecoder().decode(data.Body);
-        raw = decodeQuotedPrintable(raw);
-
+        const raw = new TextDecoder().decode(data.Body);
         const [headerPart, ...bodyParts] = raw.split(/\r?\n\r?\n/);
-        const headers = parseHeaders(headerPart);
-        const fullBody = bodyParts.join("\n\n");
+        const headers = parseHeaders(raw);
+        const fullBody = bodyParts.join("\r\n\r\n");
 
-        emailContent.innerHTML = `
+        // Try to extract the best readable part from MIME structure
+        let displayBody = "";
+        let isHTML = false;
+
+        if (headers.contentType.toLowerCase().includes("multipart/")) {
+          const best = extractBestPart(fullBody, headers.contentType);
+          if (best) {
+            displayBody = best.body;
+            isHTML = best.contentType.toLowerCase().includes("text/html");
+          } else {
+            displayBody = "Could not extract readable content from this email.";
+          }
+        } else {
+          // Single-part email
+          displayBody = decodeBody(fullBody, headers.contentTransferEncoding);
+          isHTML = headers.contentType.toLowerCase().includes("text/html");
+        }
+
+        // Build header display
+        const headerHTML = `
           <div class="mb-4 border-b pb-2 text-sm">
-            <p><b>From:</b> ${headers.from}</p>
-            <p><b>To:</b> ${headers.to}</p>
-            <p><b>Subject:</b> ${headers.subject}</p>
-            <p class="text-xs text-gray-500">${headers.date}</p>
-          </div>
-          <div class="whitespace-pre-wrap bg-gray-50 p-4 rounded leading-relaxed">${fullBody}</div>
-        `;
+            <p><b>From:</b> ${escapeHTML(headers.from)}</p>
+            <p><b>To:</b> ${escapeHTML(headers.to)}</p>
+            <p><b>Subject:</b> ${escapeHTML(headers.subject)}</p>
+            <p class="text-xs text-gray-500">${escapeHTML(headers.date)}</p>
+          </div>`;
+
+        if (isHTML) {
+          // Render HTML email in a sandboxed iframe
+          emailContent.innerHTML = headerHTML +
+            `<iframe id="emailFrame" class="w-full border rounded bg-white" sandbox="allow-same-origin" style="min-height: 400px;"></iframe>`;
+          const iframe = document.getElementById("emailFrame");
+          iframe.addEventListener('load', () => {
+            // Auto-resize iframe to content height
+            try {
+              const h = iframe.contentDocument.body.scrollHeight;
+              iframe.style.height = (h + 40) + "px";
+            } catch(e) {}
+          });
+          const doc = iframe.contentDocument || iframe.contentWindow.document;
+          doc.open();
+          doc.write(sanitizeHTML(displayBody));
+          doc.close();
+        } else {
+          // Plain text
+          emailContent.innerHTML = headerHTML +
+            `<div class="whitespace-pre-wrap bg-gray-50 p-4 rounded leading-relaxed">${escapeHTML(displayBody)}</div>`;
+        }
       });
     }
 
@@ -144,7 +334,7 @@
       onclick="window.open('https://loansifternow.optimalblue.com/', '_blank');"
       class="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg shadow font-semibold"
     >
-      🔗 Open Optimal Blue Portal
+      &#x1F517; Open Optimal Blue Portal
     </button>
   </div>
 </body>
